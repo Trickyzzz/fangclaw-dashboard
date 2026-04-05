@@ -1,0 +1,48 @@
+{
+  "version": "7",
+  "dialect": "mysql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "5",
+      "when": 1775230659622,
+      "tag": "0000_magical_peter_quill",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "5",
+      "when": 1775230742918,
+      "tag": "0001_curious_alex_wilder",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "5",
+      "when": 1775230917227,
+      "tag": "0002_huge_nekra",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "5",
+      "when": 1775273803878,
+      "tag": "0003_small_wild_child",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "5",
+      "when": 1775280079666,
+      "tag": "0004_loose_lionheart",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "5",
+      "when": 1775282843468,
+      "tag": "0005_deep_lionheart",
+      "breakpoints": true
+    }
+  ]
+}

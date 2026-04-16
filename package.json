@@ -8,6 +8,12 @@
     "build": "vite build && esbuild server/_core/index.ts --platform=node --packages=external --bundle --format=esm --outdir=dist",
     "start": "node scripts/run-server.mjs production",
     "check": "tsc --noEmit",
+    "check:readiness": "node scripts/check-readiness.mjs",
+    "check:demo": "node scripts/check-demo-ready.mjs",
+    "verify": "pnpm run check && pnpm run build && pnpm run check:demo",
+    "prod:restart": "node scripts/restart-prod.mjs",
+    "security:scan-secrets": "node scripts/scan-secrets.mjs",
+    "hooks:install": "node scripts/install-git-hooks.mjs",
     "format": "prettier --write .",
     "test": "vitest run",
     "db:push": "drizzle-kit generate && drizzle-kit migrate"

@@ -21,6 +21,7 @@ const child = spawn(process.execPath, [path.join(projectRoot, "dist", "index.js"
   env: {
     ...process.env,
     NODE_ENV: "production",
+    PORT: process.env.PORT || "3100",
   },
 });
 

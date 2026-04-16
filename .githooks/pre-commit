@@ -1,0 +1,12 @@
+#!/usr/bin/env sh
+
+echo "[pre-commit] Running secret scan..."
+corepack pnpm run security:scan-secrets
+status=$?
+
+if [ $status -ne 0 ]; then
+  echo "[pre-commit] blocked by secret scan."
+  exit $status
+fi
+
+exit 0

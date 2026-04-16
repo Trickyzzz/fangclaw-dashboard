@@ -31,6 +31,7 @@ const child = spawn(command[0], command[1], {
   env: {
     ...process.env,
     NODE_ENV: mode,
+    ...(mode === "production" && !process.env.PORT ? { PORT: "3100" } : {}),
   },
 });
 

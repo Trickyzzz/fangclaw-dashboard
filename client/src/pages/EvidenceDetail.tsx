@@ -87,6 +87,81 @@ const NODE_STYLES: Record<NodeType, { color: string; bg: string; border: string;
   impact:    { color: "#EF4444", bg: "rgba(239,68,68,0.08)",   border: "rgba(239,68,68,0.3)",   label: "影响",   labelEn: "IMPACT" },
 };
 
+function formatReasoningValue(value: unknown): string {
+  if (value == null) return "";
+  if (typeof value === "string") return value.trim();
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) {
+    return value.map(formatReasoningValue).filter(Boolean).join(" → ");
+  }
+  if (typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    const from = formatReasoningValue(obj.from ?? obj.source ?? obj.event);
+    const relation = formatReasoningValue(obj.relation ?? obj.cause ?? obj.mechanism ?? obj.reason);
+    const to = formatReasoningValue(obj.to ?? obj.target ?? obj.impact);
+
+    if (from || relation || to) {
+      return [from, relation, to].filter(Boolean).join(" → ");
+    }
+
+    return Object.entries(obj)
+      .map(([key, val]) => {
+        const formatted = formatReasoningValue(val);
+        return formatted ? `${key}: ${formatted}` : "";
+      })
+      .filter(Boolean)
+      .join("；");
+  }
+  return String(value);
+}
+
+function extractReasoningSteps(value: unknown): string[] {
+  if (value == null) return [];
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (!text || text === "[object Object]") return [];
+    return text.split(/[→➜]/).map(s => s.trim()).filter(Boolean);
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap(extractReasoningSteps).filter(Boolean);
+  }
+  if (typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    const structured =
+      obj.steps ??
+      obj.reasoningSteps ??
+      obj.causalChain ??
+      obj.causalFlow ??
+      obj.flow ??
+      obj.nodes;
+
+    if (structured) {
+      const steps = extractReasoningSteps(structured);
+      if (steps.length > 0) return steps;
+    }
+
+    const formatted = formatReasoningValue(obj);
+    return formatted ? [formatted] : [];
+  }
+  const formatted = formatReasoningValue(value);
+  return formatted ? [formatted] : [];
+}
+
+function buildFallbackReasoningSteps(
+  sourceMessage: string,
+  analysis: NonNullable<import("@/lib/api").EvidenceChain["analysis"]>,
+  impacts: NonNullable<import("@/lib/api").EvidenceChain["impacts"]>
+) {
+  const steps = [
+    sourceMessage ? `事件输入：${sourceMessage}` : "",
+    analysis.impactAssessment ? `系统判断：${analysis.impactAssessment}` : "",
+    impacts.length > 0
+      ? `影响落点：${impacts.map(impact => `${impact.name}(${impact.symbol}) W${impact.oldWeight}→W${impact.newWeight}`).join("，")}`
+      : "影响落点：未形成直接权重调整",
+  ].filter(Boolean);
+  return steps.length > 0 ? steps : ["旧版证据链缺少可解析推理链，建议重新运行一次分析生成新版结构化证据。"];
+}
+
 function CausalFlowNode({ step, index, total }: { step: string; index: number; total: number }) {
   const isLast = index === total - 1;
   const nodeType = getNodeType(step, index, total);
@@ -184,10 +259,13 @@ export default function EvidenceDetail() {
   const verificationQuestions = evidence.verificationQuestions ?? [];
   const createdTime = new Date(evidence.createdAt);
 
-  // 将推理过程拆分为步骤
-  const reasoningSteps = analysis?.reasoning
-    ? analysis.reasoning.split(/[→➜]/).map(s => s.trim()).filter(Boolean)
-    : [];
+  // 将推理过程拆分为步骤。历史证据链里 reasoning 可能是字符串、数组或结构化对象。
+  const reasoningValue = analysis?.reasoning as unknown;
+  const extractedReasoningSteps = extractReasoningSteps(reasoningValue);
+  const reasoningSteps = analysis && extractedReasoningSteps.length === 0
+    ? buildFallbackReasoningSteps(evidence.sourceMessage, analysis, impacts)
+    : extractedReasoningSteps;
+  const reasoningText = reasoningSteps.join(" → ");
 
   return (
     <div className="min-h-screen bg-background">
@@ -347,7 +425,7 @@ export default function EvidenceDetail() {
                 </div>
               ) : (
                 <p className="text-sm text-foreground/80 leading-relaxed">
-                  {analysis.reasoning}
+                  {reasoningText}
                 </p>
               )}
             </div>
@@ -483,11 +561,11 @@ export default function EvidenceDetail() {
                     <p className="text-sm text-foreground/80 leading-relaxed mb-2.5">{s.description}</p>
                     <div className="mb-2">
                       <span className="text-[10px] text-muted-foreground uppercase tracking-wider">触发条件</span>
-                      <p className="text-xs text-foreground/60 mt-0.5">{s.trigger}</p>
+                      <p className="text-xs text-foreground/60 mt-0.5">{(s.trigger || "").trim() || "待补充触发条件"}</p>
                     </div>
                     <div>
                       <span className="text-[10px] text-muted-foreground uppercase tracking-wider">池影响</span>
-                      <p className="text-xs mt-0.5" style={{ color }}>{s.poolImpact}</p>
+                      <p className="text-xs mt-0.5" style={{ color }}>{(s.poolImpact || "").trim() || "待补充池影响说明"}</p>
                     </div>
                   </div>
                 );
@@ -518,16 +596,16 @@ export default function EvidenceDetail() {
         )}
 
         {/* ===== Section 6: 关联变更日志 Related Change Logs ===== */}
-        {relatedLogs.length > 0 && (
-          <section>
-            <div className="flex items-center gap-2 mb-3">
-              <Layers className="w-4 h-4 text-fang-cyan" />
-              <h2 className="text-sm font-semibold text-foreground">关联变更日志</h2>
-              <span className="text-[10px] text-muted-foreground">Related Change Logs</span>
-              <span className="font-data text-[10px] px-1.5 py-0.5 bg-fang-cyan/10 text-fang-cyan border border-fang-cyan/20 ml-1">
-                {relatedLogs.length} entries
-              </span>
-            </div>
+        <section>
+          <div className="flex items-center gap-2 mb-3">
+            <Layers className="w-4 h-4 text-fang-cyan" />
+            <h2 className="text-sm font-semibold text-foreground">关联变更日志</h2>
+            <span className="text-[10px] text-muted-foreground">Related Change Logs</span>
+            <span className="font-data text-[10px] px-1.5 py-0.5 bg-fang-cyan/10 text-fang-cyan border border-fang-cyan/20 ml-1">
+              {relatedLogs.length} entries
+            </span>
+          </div>
+          {relatedLogs.length > 0 ? (
             <div className="bg-[#0A0F1A] border border-border/30 divide-y divide-border/20">
               {relatedLogs.map((log) => {
                 const time = new Date(log.timestamp);
@@ -554,8 +632,12 @@ export default function EvidenceDetail() {
                 );
               })}
             </div>
-          </section>
-        )}
+          ) : (
+            <div className="bg-[#0A0F1A] border border-border/30 px-5 py-4 text-xs text-muted-foreground">
+              当前证据链暂无关联日志，建议回到右侧“证据链”面板查看实时新增记录。
+            </div>
+          )}
+        </section>
 
         {/* ===== Section 7: 因子回测模拟 P2-A ===== */}
         <BacktestSection evidenceId={evidenceId} />

@@ -64,6 +64,26 @@ export interface CninfoAnnouncementFeedItem {
   url: string;
 }
 
+export interface MarketNewsFeedItem {
+  id: string;
+  title: string;
+  summary: string;
+  source: "wallstreetcn";
+  sourceLabel: string;
+  publishedAt: string;
+  url: string;
+  symbols: string[];
+}
+
+export interface IfindRealtimeQuote {
+  symbol: string;
+  time: string | null;
+  open: number | null;
+  high: number | null;
+  low: number | null;
+  latest: number | null;
+}
+
 export interface IngestionStatusSnapshot {
   running: boolean;
   lastRunAt: string | null;
@@ -72,6 +92,17 @@ export interface IngestionStatusSnapshot {
   observedCount: number;
   appliedCount: number;
   lastError: string | null;
+}
+
+export interface SystemReadiness {
+  mode: "realtime" | "demo";
+  databaseConfigured: boolean;
+  databaseConnected: boolean;
+  dataInitialized: boolean;
+  llmConfigured: boolean;
+  oauthConfigured: boolean;
+  ingestion: IngestionStatusSnapshot;
+  missing: string[];
 }
 
 // 保留静态主题和锚点数据（这些不需要从 DB 获取）
@@ -120,6 +151,27 @@ export function useCompanies() {
     price_change: c.priceChange,
   }));
   return { companies, isLoading: query.isLoading, error: query.error, refetch: query.refetch };
+}
+
+export function useCompany(symbol: string) {
+  const query = trpc.companies.getBySymbol.useQuery(
+    { symbol },
+    { enabled: !!symbol }
+  );
+  const raw = query.data as any;
+  const company: Company | null = raw ? {
+    symbol: raw.symbol,
+    name: raw.name,
+    weight: raw.weight,
+    sector: raw.sector ?? "",
+    chain_position: raw.chainPosition as "上游" | "中游" | "下游",
+    added_at: raw.addedAt ? new Date(raw.addedAt).toISOString().slice(0, 10) : "",
+    last_change: raw.lastChange ? new Date(raw.lastChange).toISOString().slice(0, 10) : null,
+    tags: (raw.tags ?? []) as string[],
+    latest_price: raw.latestPrice,
+    price_change: raw.priceChange,
+  } : null;
+  return { company, isLoading: query.isLoading, error: query.error, refetch: query.refetch };
 }
 
 export function useCompanyStats() {
@@ -179,12 +231,47 @@ export function useCninfoRecentAnnouncements(limit = 5) {
   };
 }
 
+export function useMarketNews(limit = 6, channel: "a-stock-channel" | "global-channel" = "a-stock-channel") {
+  const query = trpc.dataSources.marketNews.useQuery({ limit, channel });
+  return {
+    news: (query.data ?? []) as MarketNewsFeedItem[],
+    isLoading: query.isLoading,
+    error: query.error,
+    refetch: query.refetch,
+  };
+}
+
+export function useIfindRealtimeQuotes(codes: string[]) {
+  const query = trpc.dataSources.ifindRealtimeQuotes.useQuery(
+    { codes },
+    { enabled: codes.length > 0, retry: false }
+  );
+  return {
+    quotes: (query.data ?? []) as IfindRealtimeQuote[],
+    isLoading: query.isLoading,
+    error: query.error,
+    refetch: query.refetch,
+  };
+}
+
 export function useIngestionStatus() {
   const query = trpc.system.ingestion.status.useQuery(undefined, {
     refetchInterval: 15000,
   });
   return {
     ingestionStatus: (query.data ?? null) as IngestionStatusSnapshot | null,
+    isLoading: query.isLoading,
+    error: query.error,
+    refetch: query.refetch,
+  };
+}
+
+export function useSystemReadiness() {
+  const query = trpc.system.readiness.useQuery(undefined, {
+    refetchInterval: 15000,
+  });
+  return {
+    readiness: (query.data ?? null) as SystemReadiness | null,
     isLoading: query.isLoading,
     error: query.error,
     refetch: query.refetch,
@@ -331,5 +418,31 @@ export function useDisclaimer() {
   return {
     disclaimer: query.data,
     isLoading: query.isLoading,
+  };
+}
+
+export function getWatchOwnerKey() {
+  const storageKey = "fangclaw_watch_owner_v1";
+  const existing = window.localStorage.getItem(storageKey);
+  if (existing) return existing;
+  const created = `owner_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  window.localStorage.setItem(storageKey, created);
+  return created;
+}
+
+export function useWatchlist(ownerKey: string) {
+  const listQuery = trpc.watchlist.list.useQuery(
+    { ownerKey },
+    { enabled: !!ownerKey }
+  );
+  const addMut = trpc.watchlist.add.useMutation();
+  const removeMut = trpc.watchlist.remove.useMutation();
+  return {
+    symbols: (listQuery.data ?? []) as string[],
+    isLoading: listQuery.isLoading,
+    error: listQuery.error,
+    refetch: listQuery.refetch,
+    add: addMut,
+    remove: removeMut,
   };
 }

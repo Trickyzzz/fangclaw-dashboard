@@ -1,19 +1,41 @@
 import { useChangeLogs, type ChangeLogEntry } from "@/lib/api";
 import { ArrowUpCircle, PlusCircle, Settings, Clock, Loader2, Brain, ExternalLink } from "lucide-react";
 import { Link } from "wouter";
+import { useMemo, useState } from "react";
 
 function ActionIcon({ action }: { action: string }) {
   switch (action) {
     case "init":
       return <Settings className="w-4 h-4 text-fang-cyan" />;
     case "add":
+    case "pool_add":
       return <PlusCircle className="w-4 h-4 text-fang-green" />;
     case "weight":
       return <ArrowUpCircle className="w-4 h-4 text-fang-amber" />;
     case "analysis":
+    case "discovery":
       return <Brain className="w-4 h-4 text-fang-cyan" />;
+    case "pool_remove":
+    case "pool_edit":
+    case "pool_bulk_import":
+      return <Settings className="w-4 h-4 text-fang-amber" />;
     default:
       return <Clock className="w-4 h-4 text-muted-foreground" />;
+  }
+}
+
+function actionLabel(action: string) {
+  switch (action) {
+    case "init": return "初始化";
+    case "add":
+    case "pool_add": return "新增";
+    case "pool_edit": return "编辑";
+    case "pool_remove": return "移除";
+    case "pool_bulk_import": return "批量导入";
+    case "weight": return "调仓";
+    case "analysis": return "分析";
+    case "discovery": return "发现";
+    default: return action;
   }
 }
 
@@ -32,11 +54,11 @@ function LogEntry({ entry }: { entry: ChangeLogEntry }) {
           <span className="font-data text-xs text-muted-foreground">{timeStr}</span>
           <span className={`text-xs px-2 py-0.5 border font-data uppercase ${
             entry.action === "init" ? "border-fang-cyan/30 text-fang-cyan" :
-            entry.action === "add" ? "border-fang-green/30 text-fang-green" :
-            entry.action === "analysis" ? "border-fang-cyan/30 text-fang-cyan" :
+            entry.action === "add" || entry.action === "pool_add" ? "border-fang-green/30 text-fang-green" :
+            entry.action === "analysis" || entry.action === "discovery" ? "border-fang-cyan/30 text-fang-cyan" :
             "border-fang-amber/30 text-fang-amber"
           }`}>
-            {entry.action}
+            {actionLabel(entry.action)}
           </span>
           {entry.symbol && (
             <span className="font-data text-sm text-foreground/70">{entry.symbol}</span>
@@ -69,6 +91,12 @@ function LogEntry({ entry }: { entry: ChangeLogEntry }) {
 
 export default function ChangeLog() {
   const { logs, isLoading } = useChangeLogs(50);
+  const [showAutoPatrol, setShowAutoPatrol] = useState(false);
+
+  const visibleLogs = useMemo(() => {
+    if (showAutoPatrol) return logs;
+    return logs.filter(log => !String(log.message || "").startsWith("自动巡检记录候选证据链"));
+  }, [logs, showAutoPatrol]);
 
   if (isLoading) {
     return (
@@ -86,19 +114,35 @@ export default function ChangeLog() {
         <div className="flex items-center gap-2.5">
           <h2 className="text-lg font-bold text-foreground">证据链</h2>
         </div>
-        <span className="font-data text-sm text-muted-foreground">
-          {logs.length} 条记录
-        </span>
+        <div className="flex items-center gap-3">
+          <button
+            onClick={() => setShowAutoPatrol(v => !v)}
+            className={`text-xs px-2 py-0.5 border transition-colors ${
+              showAutoPatrol
+                ? "border-fang-amber/40 text-fang-amber bg-fang-amber/10"
+                : "border-border/40 text-muted-foreground hover:text-foreground"
+            }`}
+          >
+            自动巡检
+          </button>
+          <span className="font-data text-sm text-muted-foreground">
+            {visibleLogs.length}/{logs.length}
+          </span>
+        </div>
+      </div>
+
+      <div className="px-5 py-2 border-b border-border/20 bg-fang-cyan/5 text-[11px] text-muted-foreground">
+        演示建议: 优先查看 <span className="text-fang-cyan">ANALYSIS</span> 与 <span className="text-fang-amber">WEIGHT</span> 事件
       </div>
 
       {/* Log entries */}
       <div className="flex-1 overflow-y-auto">
-        {logs.length === 0 ? (
+        {visibleLogs.length === 0 ? (
           <div className="flex items-center justify-center h-32 text-base text-muted-foreground">
             暂无变更记录
           </div>
         ) : (
-          logs.map((entry) => (
+          visibleLogs.map((entry) => (
             <LogEntry key={entry.id} entry={entry} />
           ))
         )}

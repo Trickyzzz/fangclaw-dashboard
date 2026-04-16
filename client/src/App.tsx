@@ -12,6 +12,7 @@ import Trial from "./pages/Trial";
 import SharedView from "./pages/SharedView";
 import DailyReport from "./pages/DailyReport";
 import Landing from "./pages/Landing";
+import CompanyDetail from "./pages/CompanyDetail";
 
 function Router() {
   // make sure to consider if you need authentication for certain routes
@@ -19,6 +20,7 @@ function Router() {
     <Switch>
       <Route path={"/"} component={Home} />
       <Route path={"/evidence/:id"} component={EvidenceDetail} />
+      <Route path={"/company/:symbol"} component={CompanyDetail} />
       <Route path={"/subscriptions"} component={Subscriptions} />
       <Route path={"/pricing"} component={Pricing} />
       <Route path={"/trial"} component={Trial} />

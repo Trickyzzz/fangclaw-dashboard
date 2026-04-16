@@ -1,6 +1,8 @@
-import { useEffect, useRef } from "react";
-import { useCompanies, useCompanyStats, useIndicators, CATEGORY_COLORS, CHAIN_COLORS, THEME_INFO, ANCHORS, useSecRecentFilings, useCninfoRecentAnnouncements, useIngestionStatus } from "@/lib/api";
-import { Target, Layers, BarChart3, Radar, Globe, Anchor, Loader2, Flame, FileText, ExternalLink, Bot } from "lucide-react";
+import { useEffect, useMemo, useRef } from "react";
+import { useCompanies, useCompanyStats, useIndicators, CATEGORY_COLORS, CHAIN_COLORS, THEME_INFO, ANCHORS, useSecRecentFilings, useCninfoRecentAnnouncements, useIngestionStatus, useMarketNews, useSystemReadiness, useIfindRealtimeQuotes } from "@/lib/api";
+import { buildDataFeedLayerStatus, type DataFeedEvidenceGrade, type DataFeedSourceStatus } from "@/lib/dataFeedLayers";
+import { getDisplayNameForSymbol } from "@/lib/symbolDisplay";
+import { Target, Layers, BarChart3, Radar, Globe, Anchor, Loader2, Flame, FileText, ExternalLink, Bot, Radio, ShieldCheck, Activity } from "lucide-react";
 
 function StatCard({ icon: Icon, label, value, sublabel, color }: {
   icon: React.ElementType;
@@ -31,6 +33,50 @@ function MiniBar({ label, value, max, color }: { label: string; value: number; m
       <span className="font-data text-sm w-5 text-right font-semibold" style={{ color }}>{value}</span>
     </div>
   );
+}
+
+function DataFeedStatusPill({ status }: { status: DataFeedSourceStatus }) {
+  const config = {
+    live: { label: "LIVE", className: "border-fang-green/30 text-fang-green bg-fang-green/10" },
+    fallback: { label: "DEMO", className: "border-fang-amber/30 text-fang-amber bg-fang-amber/10" },
+    empty: { label: "EMPTY", className: "border-border/40 text-muted-foreground bg-muted/10" },
+  }[status];
+
+  return (
+    <span className={`font-data text-[9px] px-1.5 py-0.5 border ${config.className}`}>
+      {config.label}
+    </span>
+  );
+}
+
+function DataFeedGradePill({ grade }: { grade: DataFeedEvidenceGrade }) {
+  const config = {
+    hard_evidence: { label: "硬证据", className: "border-fang-green/30 text-fang-green bg-fang-green/10" },
+    trigger: { label: "触发器", className: "border-blue-400/30 text-blue-300 bg-blue-400/10" },
+    system: { label: "状态", className: "border-fang-amber/30 text-fang-amber bg-fang-amber/10" },
+  }[grade];
+
+  return (
+    <span className={`text-[9px] px-1.5 py-0.5 border ${config.className}`}>
+      {config.label}
+    </span>
+  );
+}
+
+function formatFeedTime(value: string | null) {
+  if (!value) return "未记录";
+  if (value === "DEMO") return "DEMO";
+  const date = new Date(value);
+  if (!Number.isNaN(date.getTime())) {
+    return date.toLocaleString("zh-CN", {
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    });
+  }
+  return value;
 }
 
 /**
@@ -168,12 +214,73 @@ export default function StatsPanel() {
   const statsQuery = useCompanyStats();
   const { indicators } = useIndicators();
   const { companies } = useCompanies();
-  const { filings, isLoading: filingsLoading } = useSecRecentFilings(5);
-  const { announcements, isLoading: announcementsLoading } = useCninfoRecentAnnouncements(5);
+  const { filings, isLoading: filingsLoading, error: filingsError } = useSecRecentFilings(5);
+  const { announcements, isLoading: announcementsLoading, error: announcementsError } = useCninfoRecentAnnouncements(5);
+  const { news: marketNews, isLoading: marketNewsLoading, error: marketNewsError } = useMarketNews(5, "a-stock-channel");
+  const { quotes: ifindQuotes, isLoading: ifindLoading, error: ifindError } = useIfindRealtimeQuotes(["300033.SZ", "300557.SZ", "688256.SH"]);
   const { ingestionStatus } = useIngestionStatus();
+  const { readiness } = useSystemReadiness();
 
   const stats = statsQuery.data;
 
+  const fallbackSec = useMemo(() => ([
+    {
+      symbol: "NVDA",
+      formType: "8-K",
+      filedAt: "DEMO",
+      description: "演示样例：AI 芯片龙头提交重要事项披露（用于断网兜底展示）",
+      companyName: "NVIDIA CORP",
+      url: "#",
+      accessionNumber: "DEMO-SEC-001",
+    },
+  ]), []);
+
+  const fallbackCninfo = useMemo(() => ([
+    {
+      symbol: "300557",
+      companyName: "理工光科",
+      title: "演示样例：公司披露机器人感知业务进展（用于断网兜底展示）",
+      publishedAt: "DEMO",
+      announcementId: "DEMO-CNINFO-001",
+      pdfUrl: "#",
+      url: "#",
+    },
+  ]), []);
+
+  const fallbackNews = useMemo(() => ([
+    {
+      id: "DEMO-NEWS-001",
+      title: "演示样例：产业链上游需求升温，关注中游扩产节奏",
+      summary: "用于演示模式下的稳定展示，不代表实时行情。",
+      source: "wallstreetcn" as const,
+      sourceLabel: "演示样例",
+      publishedAt: new Date().toISOString(),
+      url: "#",
+      symbols: ["300557"],
+    },
+  ]), []);
+
+  const displayFilings = filings.length > 0 ? filings : ((filingsError || readiness?.mode === "demo") ? fallbackSec : []);
+  const displayAnnouncements = announcements.length > 0 ? announcements : ((announcementsError || readiness?.mode === "demo") ? fallbackCninfo : []);
+  const displayNews = marketNews.length > 0 ? marketNews : ((marketNewsError || readiness?.mode === "demo") ? fallbackNews : []);
+  const secFallback = filings.length === 0 && displayFilings.length > 0;
+  const cninfoFallback = announcements.length === 0 && displayAnnouncements.length > 0;
+  const marketNewsFallback = marketNews.length === 0 && displayNews.length > 0;
+  const dataFeedLayers = buildDataFeedLayerStatus({
+    cninfoCount: displayAnnouncements.length,
+    secCount: displayFilings.length,
+    marketNewsCount: displayNews.length,
+    ifindCount: ifindQuotes.length,
+    cninfoFallback,
+    secFallback,
+    marketNewsFallback,
+    ifindFallback: Boolean(ifindError),
+    ingestionRunning: Boolean(ingestionStatus?.running),
+    lastRunAt: ingestionStatus?.lastRunAt ?? null,
+    cninfoLastUpdated: displayAnnouncements[0]?.publishedAt ?? null,
+    secLastUpdated: displayFilings[0]?.filedAt ?? null,
+    marketNewsLastUpdated: displayNews[0]?.publishedAt ?? null,
+  });
   if (!stats || statsQuery.isLoading) {
     return (
       <div className="flex items-center justify-center h-full">
@@ -261,6 +368,107 @@ export default function StatsPanel() {
         )}
       </div>
 
+      {/* Data source layer overview */}
+      <div className="px-5 py-4 border-b border-border/50">
+        <div className="flex items-center gap-2 mb-3">
+          <ShieldCheck className="w-4 h-4 text-fang-green" />
+          <span className="text-xs text-muted-foreground uppercase tracking-wider">数据源雷达</span>
+          <span className="text-[10px] text-muted-foreground font-data ml-auto">DATA FEEDS</span>
+        </div>
+        <div className="space-y-2.5">
+          {dataFeedLayers.map(layer => {
+            const layerColor =
+              layer.layer === "official_disclosure"
+                ? "#00D4AA"
+                : layer.layer === "realtime_news"
+                  ? "#3B82F6"
+                  : "#F59E0B";
+            return (
+              <div key={layer.layer} className="border border-border/30 bg-card/20 px-3 py-2.5">
+                <div className="flex items-start justify-between gap-2 mb-1.5">
+                  <div>
+                    <div className="flex items-center gap-1.5">
+                      <Activity className="w-3.5 h-3.5" style={{ color: layerColor }} />
+                      <span className="text-sm font-semibold text-foreground">{layer.title}</span>
+                    </div>
+                    <p className="text-[10px] text-muted-foreground mt-0.5">{layer.description}</p>
+                  </div>
+                  <span className="text-[9px] font-data text-muted-foreground">{layer.titleEn}</span>
+                </div>
+                <div className="space-y-1.5">
+                  {layer.sources.map(source => (
+                    <div key={source.name} className="grid grid-cols-[72px_1fr_auto] gap-2 items-center">
+                      <span className="font-data text-[10px] text-muted-foreground">{source.name}</span>
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-[11px] text-foreground/75 truncate">{source.label}</span>
+                          <DataFeedGradePill grade={source.grade} />
+                        </div>
+                        <div className="font-data text-[9px] text-muted-foreground/70 mt-0.5">
+                          更新 {formatFeedTime(source.lastUpdated)}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        <span className="font-data text-[10px] text-muted-foreground">{source.count}</span>
+                        <DataFeedStatusPill status={source.status} />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* iFinD realtime quotes */}
+      <div className="px-5 py-4 border-b border-border/50">
+        <div className="flex items-center gap-2 mb-3">
+          <BarChart3 className="w-4 h-4 text-fang-green" />
+          <span className="text-xs text-muted-foreground uppercase tracking-wider">iFinD 实时行情</span>
+          <span className="text-[10px] text-muted-foreground font-data ml-auto">IFIND</span>
+        </div>
+        {ifindLoading ? (
+          <div className="flex items-center gap-2 py-4 text-sm text-muted-foreground">
+            <Loader2 className="w-4 h-4 text-fang-green animate-spin" />
+            正在拉取 iFinD 行情...
+          </div>
+        ) : ifindQuotes.length === 0 ? (
+          <p className="text-sm text-muted-foreground/60 italic py-4">
+            {ifindError ? "iFinD 暂不可用，请检查权限或代码格式" : "暂无 iFinD 行情"}
+          </p>
+        ) : (
+          <div className="space-y-2">
+            {ifindQuotes.map(quote => (
+              <div key={quote.symbol} className="border border-border/30 bg-card/20 p-3">
+                <div className="flex items-start justify-between gap-3 mb-1.5">
+                  <div className="min-w-0">
+                    <div className="text-sm font-semibold text-foreground truncate">
+                      {getDisplayNameForSymbol(quote.symbol, companies)}
+                    </div>
+                    <div className="font-data text-[10px] text-muted-foreground/70 mt-0.5">
+                      {quote.symbol}
+                    </div>
+                  </div>
+                  <span className="font-data text-[11px] text-muted-foreground flex-shrink-0">{quote.time || "实时"}</span>
+                </div>
+                <div className="grid grid-cols-4 gap-2 text-xs">
+                  <span className="text-muted-foreground">开 <b className="font-data text-foreground">{quote.open ?? "-"}</b></span>
+                  <span className="text-muted-foreground">高 <b className="font-data text-foreground">{quote.high ?? "-"}</b></span>
+                  <span className="text-muted-foreground">低 <b className="font-data text-foreground">{quote.low ?? "-"}</b></span>
+                  <span className="text-muted-foreground">现 <b className="font-data text-fang-green">{quote.latest ?? "-"}</b></span>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+        {ifindError && (
+          <div className="mt-2 text-[11px] text-fang-amber">
+            iFinD 请求失败：{ifindError.message}
+          </div>
+        )}
+      </div>
+
       {/* SEC filings feed */}
       <div className="px-5 py-4 border-b border-border/50">
         <div className="flex items-center gap-2 mb-3">
@@ -273,11 +481,11 @@ export default function StatsPanel() {
             <Loader2 className="w-4 h-4 text-fang-cyan animate-spin" />
             正在拉取官方披露...
           </div>
-        ) : filings.length === 0 ? (
+        ) : displayFilings.length === 0 ? (
           <p className="text-sm text-muted-foreground/60 italic py-4">暂无最新披露</p>
         ) : (
           <div className="space-y-2.5">
-            {filings.map(filing => (
+            {displayFilings.map(filing => (
               <a
                 key={`${filing.symbol}-${filing.accessionNumber}`}
                 href={filing.url}
@@ -301,6 +509,9 @@ export default function StatsPanel() {
             ))}
           </div>
         )}
+        {(filingsError || (filings.length === 0 && displayFilings.length > 0)) && (
+          <div className="mt-2 text-[11px] text-fang-amber">当前为演示兜底内容，实时源暂不可用。</div>
+        )}
       </div>
 
       {/* CNINFO announcements feed */}
@@ -315,11 +526,11 @@ export default function StatsPanel() {
             <Loader2 className="w-4 h-4 text-fang-amber animate-spin" />
             正在拉取 A 股公告...
           </div>
-        ) : announcements.length === 0 ? (
+        ) : displayAnnouncements.length === 0 ? (
           <p className="text-sm text-muted-foreground/60 italic py-4">暂无最新 A 股公告</p>
         ) : (
           <div className="space-y-2.5">
-            {announcements.map(item => (
+            {displayAnnouncements.map(item => (
               <a
                 key={item.announcementId}
                 href={item.pdfUrl}
@@ -342,6 +553,57 @@ export default function StatsPanel() {
               </a>
             ))}
           </div>
+        )}
+        {(announcementsError || (announcements.length === 0 && displayAnnouncements.length > 0)) && (
+          <div className="mt-2 text-[11px] text-fang-amber">当前为演示兜底内容，实时源暂不可用。</div>
+        )}
+      </div>
+
+      {/* 7x24 market news feed */}
+      <div className="px-5 py-4 border-b border-border/50">
+        <div className="flex items-center gap-2 mb-3">
+          <Radio className="w-4 h-4 text-fang-green" />
+          <span className="text-xs text-muted-foreground uppercase tracking-wider">7x24 财经快讯</span>
+          <span className="text-[10px] text-muted-foreground font-data ml-auto">WALLSTREETCN</span>
+        </div>
+        {marketNewsLoading ? (
+          <div className="flex items-center gap-2 py-4 text-sm text-muted-foreground">
+            <Loader2 className="w-4 h-4 text-fang-green animate-spin" />
+            正在拉取 7x24 快讯...
+          </div>
+        ) : displayNews.length === 0 ? (
+          <p className="text-sm text-muted-foreground/60 italic py-4">暂无最新快讯</p>
+        ) : (
+          <div className="space-y-2.5">
+            {displayNews.map(item => (
+              <a
+                key={item.id}
+                href={item.url}
+                target="_blank"
+                rel="noreferrer"
+                className="block border border-border/30 bg-card/20 p-3 hover:bg-fang-green/5 hover:border-fang-green/20 transition-colors"
+              >
+                <div className="flex items-center gap-2 mb-1">
+                  <span className="font-data text-xs px-2 py-0.5 bg-fang-green/10 text-fang-green border border-fang-green/20">
+                    7x24
+                  </span>
+                  <span className="ml-auto font-data text-[11px] text-muted-foreground">
+                    {new Date(item.publishedAt).toLocaleString("zh-CN", { hour12: false })}
+                  </span>
+                </div>
+                <p className="text-sm font-semibold text-foreground line-clamp-2">{item.title}</p>
+                <div className="mt-1 flex items-center gap-1 text-xs text-muted-foreground">
+                  <span className="truncate">
+                    {item.symbols.length > 0 ? `命中: ${item.symbols.join(" / ")}` : "市场全局快讯"}
+                  </span>
+                  <ExternalLink className="w-3 h-3 flex-shrink-0" />
+                </div>
+              </a>
+            ))}
+          </div>
+        )}
+        {(marketNewsError || (marketNews.length === 0 && displayNews.length > 0)) && (
+          <div className="mt-2 text-[11px] text-fang-amber">当前为演示兜底内容，实时源暂不可用。</div>
         )}
       </div>
 

@@ -1,4 +1,4 @@
-import { useCompanies, useIndicators, ANCHORS, useIngestionStatus } from "@/lib/api";
+import { useCompanies, useIndicators, ANCHORS, useIngestionStatus, useSystemReadiness } from "@/lib/api";
 import { Shield, Radio, Crosshair, Bot } from "lucide-react";
 import { useState, useEffect } from "react";
 
@@ -6,6 +6,7 @@ export default function StatusBar() {
   const { companies } = useCompanies();
   const { indicators } = useIndicators();
   const { ingestionStatus } = useIngestionStatus();
+  const { readiness } = useSystemReadiness();
 
   const [timeStr, setTimeStr] = useState("");
   const [dateStr, setDateStr] = useState("");
@@ -71,6 +72,17 @@ export default function StatusBar() {
             <span className="font-data text-base font-bold text-fang-cyan">{ingestionStatus?.appliedCount ?? 0}</span>
             <span className="text-xs text-muted-foreground">自动落地</span>
           </div>
+          <div className="flex items-center gap-2">
+            <span
+              className={`font-data text-[10px] px-2 py-1 border ${
+                readiness?.mode === "realtime"
+                  ? "bg-fang-green/10 text-fang-green border-fang-green/30"
+                  : "bg-fang-amber/10 text-fang-amber border-fang-amber/30"
+              }`}
+            >
+              {readiness?.mode === "realtime" ? "实时模式" : "演示模式"}
+            </span>
+          </div>
           <div className="h-5 w-px bg-border/50" />
           <div className="flex items-center gap-2">
             {ANCHORS.map(a => (
@@ -88,6 +100,11 @@ export default function StatusBar() {
           {ingestionStatus?.lastRunAt && (
             <div className="font-data text-[10px] text-fang-cyan/80 mt-1">
               巡检 {new Date(ingestionStatus.lastRunAt).toLocaleTimeString("zh-CN", { hour12: false })}
+            </div>
+          )}
+          {readiness && readiness.missing.length > 0 && (
+            <div className="font-data text-[10px] text-fang-amber/90 mt-1 max-w-[320px] truncate" title={`缺失项: ${readiness.missing.join(" | ")}`}>
+              演示模式缺失项：{readiness.missing.length} 项
             </div>
           )}
         </div>

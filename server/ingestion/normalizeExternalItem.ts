@@ -1,5 +1,6 @@
 import type { CninfoAnnouncementItem } from "../data-sources/cninfo";
 import type { SecFilingItem } from "../data-sources/secEdgar";
+import type { MarketNewsItem } from "../data-sources/wallstreetcn";
 import type { IngestionCandidate } from "./types";
 
 export function normalizeSecItem(item: SecFilingItem): IngestionCandidate {
@@ -25,5 +26,19 @@ export function normalizeCninfoItem(item: CninfoAnnouncementItem): IngestionCand
     publishedAt: item.publishedAt,
     url: item.pdfUrl,
     rawText: `${item.symbol} ${item.companyName} ${item.title}`,
+  };
+}
+
+export function normalizeWallstreetcnItem(item: MarketNewsItem): IngestionCandidate {
+  const primarySymbol = item.symbols[0] ?? "MARKET";
+  return {
+    source: "wallstreetcn",
+    externalId: item.id,
+    symbol: primarySymbol,
+    companyName: item.symbols.length > 0 ? item.symbols.join("/") : "市场快讯",
+    title: item.title,
+    publishedAt: item.publishedAt,
+    url: item.url,
+    rawText: `${item.title} ${item.summary} ${item.symbols.join(" ")}`.trim(),
   };
 }

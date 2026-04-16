@@ -1,5 +1,5 @@
 export type IngestionCandidate = {
-  source: "sec" | "cninfo";
+  source: "sec" | "cninfo" | "wallstreetcn";
   externalId: string;
   symbol: string;
   companyName: string;

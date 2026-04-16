@@ -5,9 +5,11 @@ import {
   detectAndNotify,
   getAllCompanies,
   getAllIndicators,
+  getDb,
   updateCompanyWeight,
   updateIndicatorStatusV3,
 } from "../db";
+import { isSqliteMode } from "../sqliteStore";
 import type { MixedModeDecision } from "./types";
 import { shouldApplyImpacts } from "./relevance";
 
@@ -98,9 +100,317 @@ type ExecuteAnalysisInput = {
   decisionMode?: MixedModeDecision | "auto";
 };
 
+const normalizeMatchText = (value: string) =>
+  value
+    .toUpperCase()
+    .replace(/[（()）\s._-]/g, "")
+    .replace(/[^0-9A-Z\u4E00-\u9FFF]/g, "");
+
+const buildSymbolAliases = (symbol: string) => {
+  const upper = symbol.toUpperCase();
+  const compact = upper.replace(/[^0-9A-Z]/g, "");
+  const noSuffix = upper.replace(/\.(SZ|SH|SS|HK|US)$/i, "");
+  const aliases = new Set([upper, compact, noSuffix]);
+
+  const sixDigits = noSuffix.match(/\b\d{6}\b/)?.[0] ?? (noSuffix.length === 6 && /^\d+$/.test(noSuffix) ? noSuffix : "");
+  if (sixDigits) {
+    aliases.add(sixDigits);
+    aliases.add(`SZ${sixDigits}`);
+    aliases.add(`SH${sixDigits}`);
+  }
+
+  return Array.from(aliases).map(normalizeMatchText).filter(Boolean);
+};
+
+function parsePossiblyWrappedJson(text: string) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    const fencedMatch = text.match(/```json\s*([\s\S]*?)\s*```/i);
+    if (fencedMatch?.[1]) {
+      return JSON.parse(fencedMatch[1]);
+    }
+
+    const firstBrace = text.indexOf("{");
+    const lastBrace = text.lastIndexOf("}");
+    if (firstBrace >= 0 && lastBrace > firstBrace) {
+      return JSON.parse(text.slice(firstBrace, lastBrace + 1));
+    }
+    throw new Error("AI 分析返回的文本不是有效 JSON");
+  }
+}
+
+function formatReasoningValue(value: unknown): string {
+  if (value == null) return "";
+  if (typeof value === "string") return value.trim();
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) {
+    return value.map(formatReasoningValue).filter(Boolean).join(" → ");
+  }
+  if (typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    const structured =
+      obj.steps ??
+      obj.reasoningSteps ??
+      obj.causalChain ??
+      obj.causalFlow ??
+      obj.flow ??
+      obj.nodes;
+
+    if (structured) {
+      const formatted = formatReasoningValue(structured);
+      if (formatted) return formatted;
+    }
+
+    const from = formatReasoningValue(obj.from ?? obj.source ?? obj.event);
+    const relation = formatReasoningValue(obj.relation ?? obj.cause ?? obj.mechanism ?? obj.reason);
+    const to = formatReasoningValue(obj.to ?? obj.target ?? obj.impact);
+
+    if (from || relation || to) {
+      return [from, relation, to].filter(Boolean).join(" → ");
+    }
+
+    return Object.entries(obj)
+      .map(([key, val]) => {
+        const formatted = formatReasoningValue(val);
+        return formatted ? `${key}: ${formatted}` : "";
+      })
+      .filter(Boolean)
+      .join("；");
+  }
+  return String(value);
+}
+
+function normalizeParsedAnalysis(
+  raw: any,
+  fallback: ParsedAnalysis,
+  currentCompanies: Awaited<ReturnType<typeof getAllCompanies>>
+): ParsedAnalysis {
+  if (!raw || typeof raw !== "object") return fallback;
+
+  const canonicalSymbolByAlias = new Map<string, string>();
+  for (const company of currentCompanies) {
+    const aliases = buildSymbolAliases(company.symbol);
+    for (const alias of aliases) {
+      canonicalSymbolByAlias.set(alias, company.symbol);
+    }
+  }
+
+  const normalizeToCanonicalSymbol = (rawSymbol: unknown) => {
+    const normalized = normalizeMatchText(String(rawSymbol ?? ""));
+    return canonicalSymbolByAlias.get(normalized) ?? "";
+  };
+
+  const impacts = Array.isArray(raw.impacts)
+    ? raw.impacts
+        .map((item: any) => ({
+          symbol: normalizeToCanonicalSymbol(item?.symbol),
+          name: String(item?.name ?? ""),
+          weightDelta: Number.isFinite(Number(item?.weightDelta)) ? Number(item.weightDelta) : 0,
+          direction: item?.direction === "up" || item?.direction === "down" || item?.direction === "neutral" ? item.direction : "neutral",
+          reason: String(item?.reason ?? "模型返回未提供理由，已降级为中性处理。"),
+        }))
+        .filter((item: { symbol: string }) => Boolean(item.symbol))
+    : fallback.impacts;
+
+  const relatedIndicators = Array.isArray(raw.relatedIndicators)
+    ? raw.relatedIndicators.map((id: any) => Number(id)).filter((id: number) => Number.isFinite(id))
+    : fallback.relatedIndicators;
+
+  const defaultScenarioTrigger = (nameEn: string) => {
+    const lower = String(nameEn || "").toLowerCase();
+    if (lower === "bull") return "订单、业绩或政策持续超预期";
+    if (lower === "bear") return "业绩落空或外部风险扰动";
+    return "后续公告与产业数据无明显偏离";
+  };
+
+  const defaultScenarioPoolImpact = (nameEn: string) => {
+    const lower = String(nameEn || "").toLowerCase();
+    if (lower === "bull") return "主线扩散，上中下游联动增强";
+    if (lower === "bear") return "高弹性标的回撤，权重回归均值";
+    return "结构性分化，核心标的小幅走强";
+  };
+
+  const scenarios = Array.isArray(raw.scenarios) && raw.scenarios.length > 0
+    ? raw.scenarios
+        .map((s: any) => ({
+          name: String(s?.name ?? "基准情景"),
+          nameEn: String(s?.nameEn ?? "Base"),
+          probability: Number.isFinite(Number(s?.probability)) ? Number(s.probability) : 0,
+          description: String(s?.description ?? ""),
+          trigger: String(s?.trigger ?? "").trim() || defaultScenarioTrigger(String(s?.nameEn ?? "Base")),
+          poolImpact: String(s?.poolImpact ?? "").trim() || defaultScenarioPoolImpact(String(s?.nameEn ?? "Base")),
+        }))
+    : fallback.scenarios;
+
+  const normalizeDim = (key: keyof ParsedAnalysis["dimensionScores"]): DimScore => {
+    const source = raw?.dimensionScores?.[key];
+    const fallbackDim = fallback.dimensionScores[key];
+    const scoreValue = Number(source?.score);
+    const safeScore = Number.isFinite(scoreValue) ? Math.max(0, Math.min(10, scoreValue)) : fallbackDim.score;
+    const safeDirection =
+      source?.direction === "up" || source?.direction === "down" || source?.direction === "neutral"
+        ? source.direction
+        : fallbackDim.direction;
+    const safeBrief =
+      typeof source?.brief === "string" && source.brief.trim().length > 0
+        ? source.brief
+        : fallbackDim.brief;
+    return {
+      score: safeScore,
+      direction: safeDirection,
+      brief: safeBrief,
+    };
+  };
+
+  return {
+    ...fallback,
+    summary: String(raw.summary ?? fallback.summary),
+    entities: Array.isArray(raw.entities) ? raw.entities.map((v: any) => String(v)).filter(Boolean) : fallback.entities,
+    relatedIndicators,
+    impacts: impacts.length > 0 ? impacts : fallback.impacts,
+    impactAssessment: String(raw.impactAssessment ?? fallback.impactAssessment),
+    confidence: Number.isFinite(Number(raw.confidence)) ? Number(raw.confidence) : fallback.confidence,
+    reasoning: formatReasoningValue(raw.reasoning) || fallback.reasoning,
+    counterArgument: String(raw.counterArgument ?? fallback.counterArgument),
+    macroRegime: raw.macroRegime === "expansion" || raw.macroRegime === "contraction" || raw.macroRegime === "policy_pivot" || raw.macroRegime === "liquidity_squeeze" || raw.macroRegime === "stagflation"
+      ? raw.macroRegime
+      : fallback.macroRegime,
+    nonObviousInsight: String(raw.nonObviousInsight ?? fallback.nonObviousInsight),
+    verificationQuestions: Array.isArray(raw.verificationQuestions)
+      ? raw.verificationQuestions.map((v: any) => String(v)).filter(Boolean)
+      : fallback.verificationQuestions,
+    dimensionScores: {
+      fundamental: normalizeDim("fundamental"),
+      technical: normalizeDim("technical"),
+      flow: normalizeDim("flow"),
+      catalyst: normalizeDim("catalyst"),
+      sentiment: normalizeDim("sentiment"),
+      alternative: normalizeDim("alternative"),
+    },
+    scenarios,
+  };
+}
+
+function buildFallbackAnalysis(
+  message: string,
+  currentCompanies: Awaited<ReturnType<typeof getAllCompanies>>,
+  currentIndicators: Awaited<ReturnType<typeof getAllIndicators>>,
+  error?: unknown
+): ParsedAnalysis {
+  const isRelationQuestion = /[?？]|有关系|关联|相关|是否/.test(message);
+  const text = message.toLowerCase();
+  const positiveWords = ["增长", "上市", "合作", "中标", "突破", "增持", "订单", "ipo", "获批", "落地"];
+  const negativeWords = ["下滑", "亏损", "制裁", "收紧", "减持", "风险", "处罚", "暴跌", "违约", "停产"];
+  const posHit = positiveWords.filter(k => text.includes(k)).length;
+  const negHit = negativeWords.filter(k => text.includes(k)).length;
+  const netSignal = posHit - negHit;
+  const direction: "up" | "down" | "neutral" = netSignal > 0 ? "up" : netSignal < 0 ? "down" : "neutral";
+  const weightDelta = direction === "up" ? 1 : direction === "down" ? -1 : 0;
+
+  const normalizedMessage = normalizeMatchText(message);
+  const matchedCompanies = currentCompanies.filter(c => {
+    const nameHit = normalizedMessage.includes(normalizeMatchText(c.name));
+    const symbolHit = buildSymbolAliases(c.symbol).some(alias => normalizedMessage.includes(alias));
+    return nameHit || symbolHit;
+  });
+  const pickedCompanies = (isRelationQuestion && matchedCompanies.length === 0
+    ? []
+    : (matchedCompanies.length > 0 ? matchedCompanies : currentCompanies.slice(0, 2))).slice(0, 3);
+  const impacts = pickedCompanies.map(company => ({
+    symbol: company.symbol,
+    name: company.name,
+    weightDelta,
+    direction,
+    reason: direction === "up"
+      ? "示例模式：消息语义偏正向，系统给出轻度上调建议。"
+      : direction === "down"
+        ? "示例模式：消息语义偏负向，系统给出轻度下调建议。"
+        : "示例模式：当前信号强度中性，建议维持观察。",
+  }));
+
+  const relatedIndicators = currentIndicators.slice(0, 3).map(i => i.id);
+  const baseScore = direction === "up" ? 7 : direction === "down" ? 4 : 5;
+  const confidence = matchedCompanies.length > 0 ? 68 : (isRelationQuestion ? 52 : 58);
+  const errorMessage = error instanceof Error ? error.message : String(error ?? "");
+
+  return {
+    summary: matchedCompanies.length > 0
+      ? `已识别到与目标池公司相关的信号，系统已生成可执行的演示分析结果。`
+      : isRelationQuestion
+        ? `检测到“关系研判”问句，但当前未命中目标池公司实体；已给出可执行的补充核验建议。`
+        : `未命中明确公司实体，系统基于当前目标池生成了可展示的演示分析结果。`,
+    entities: Array.from(new Set([
+      ...matchedCompanies.map(c => c.name),
+      ...message.split(/[，。,；、\s]/).filter(Boolean).slice(0, 4),
+    ])).slice(0, 8),
+    relatedIndicators,
+    impacts,
+    impactAssessment: isRelationQuestion
+      ? "当前更适合做关系核验而非直接调仓；建议先补充企业关系证据或将相关公司加入目标池。"
+      : direction === "up"
+      ? "短期偏正面，建议重点跟踪后续订单/业绩兑现。"
+      : direction === "down"
+        ? "短期偏谨慎，建议关注风险是否继续扩散。"
+        : "当前信号偏中性，建议维持观察并等待更多证据。",
+    confidence,
+    reasoning: `当前为本地兜底分析模式（无需外部 LLM Key）。系统依据消息关键词、实体命中和现有目标池状态生成示例推理。${errorMessage ? `触发原因：${errorMessage}` : ""}`,
+    counterArgument: "该结果基于规则引擎快速生成，可能忽略了财务细节、估值位置和市场预期差；实际交易前需补充一手数据验证。",
+    macroRegime: "policy_pivot",
+    nonObviousInsight: "即便单条消息看似只影响一家企业，真实传导通常会沿“上游成本-中游产能-下游需求”路径扩散，这种链式影响常被低估。",
+    verificationQuestions: isRelationQuestion
+      ? [
+          "问题中的两家公司是否都已在目标池中？若未在，请先加入后再分析。",
+          "是否有公开公告、合作协议、供应商/客户披露可证明两者存在直接关系？",
+          "若无直接关系，是否存在二级传导关系（共同客户、同产业链、替代关系）？",
+        ]
+      : [
+          "相关公司最近一个季度的核心订单和毛利率是否同步改善？",
+          "是否有新增公告或监管口径变化来验证该信号持续性？",
+          "同产业链可比公司是否出现一致方向的资金和价格共振？",
+        ],
+    dimensionScores: {
+      fundamental: { score: baseScore, direction, brief: "结合基本面关键词给出示例评分" },
+      technical: { score: 5, direction: "neutral", brief: "缺少实时K线与量价，保持中性" },
+      flow: { score: baseScore - 1, direction, brief: "按消息强弱估算资金偏好变化" },
+      catalyst: { score: baseScore + 1, direction, brief: "事件驱动信号较明确" },
+      sentiment: { score: baseScore, direction, brief: "舆情与主题热度可能放大波动" },
+      alternative: { score: 5, direction: "neutral", brief: "替代数据缺失，暂不强化判断" },
+    },
+    scenarios: [
+      {
+        name: "基准情景",
+        nameEn: "Base",
+        probability: 60,
+        description: "消息影响按当前强度平稳传导，目标池权重小幅重估。",
+        trigger: "后续公告与产业数据无明显偏离",
+        poolImpact: "结构性分化，核心标的小幅走强",
+      },
+      {
+        name: "乐观情景",
+        nameEn: "Bull",
+        probability: 25,
+        description: "行业验证数据连续超预期，资金形成趋势共振。",
+        trigger: "订单、业绩或政策持续超预期",
+        poolImpact: "主线扩散，上中下游联动增强",
+      },
+      {
+        name: "悲观情景",
+        nameEn: "Bear",
+        probability: 15,
+        description: "事件热度快速回落，预期兑现不及市场定价。",
+        trigger: "业绩落空或外部风险扰动",
+        poolImpact: "高弹性标的回撤，权重回归均值",
+      },
+    ],
+  };
+}
+
 export async function executeCausalAnalysis(input: ExecuteAnalysisInput) {
   const currentCompanies = await getAllCompanies();
   const currentIndicators = await getAllIndicators();
+  const db = await getDb();
+  const dbAvailable = isSqliteMode() || Boolean(db);
 
   const companySummary = currentCompanies.map(c =>
     `${c.symbol} ${c.name} (${c.sector}, ${c.chainPosition}, 权重${c.weight})`
@@ -152,87 +462,102 @@ ${NON_OBVIOUS_RULES}
 
 你必须严格按照 JSON Schema 格式返回结果。权重调整必须有充分理由。如果消息与公司池无关，impacts 数组为空。`;
 
-  const llmResult = await invokeLLM({
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: `请分析以下市场消息：\n\n"${input.message}"` },
-    ],
-    response_format: {
-      type: "json_schema",
-      json_schema: {
-        name: "causal_analysis",
-        strict: true,
-        schema: {
-          type: "object",
-          properties: {
-            summary: { type: "string" },
-            entities: { type: "array", items: { type: "string" } },
-            relatedIndicators: { type: "array", items: { type: "number" } },
-            impacts: {
-              type: "array",
-              items: {
+  let analysis: ParsedAnalysis;
+  let llmModel = "local-fallback";
+  let llmMode: "llm" | "fallback" = "fallback";
+  try {
+    const llmResult = await invokeLLM({
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: `请分析以下市场消息：\n\n"${input.message}"` },
+      ],
+      routingHint: "complex_reasoning",
+      response_format: {
+        type: "json_schema",
+        json_schema: {
+          name: "causal_analysis",
+          strict: true,
+          schema: {
+            type: "object",
+            properties: {
+              summary: { type: "string" },
+              entities: { type: "array", items: { type: "string" } },
+              relatedIndicators: { type: "array", items: { type: "number" } },
+              impacts: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    symbol: { type: "string" },
+                    name: { type: "string" },
+                    weightDelta: { type: "number" },
+                    direction: { type: "string", enum: ["up", "down", "neutral"] },
+                    reason: { type: "string" },
+                  },
+                  required: ["symbol", "name", "weightDelta", "direction", "reason"],
+                  additionalProperties: false,
+                },
+              },
+              impactAssessment: { type: "string" },
+              confidence: { type: "number" },
+              reasoning: { type: "string" },
+              counterArgument: { type: "string" },
+              macroRegime: { type: "string", enum: ["expansion", "contraction", "policy_pivot", "liquidity_squeeze", "stagflation"] },
+              nonObviousInsight: { type: "string" },
+              verificationQuestions: { type: "array", items: { type: "string" } },
+              dimensionScores: {
                 type: "object",
                 properties: {
-                  symbol: { type: "string" },
-                  name: { type: "string" },
-                  weightDelta: { type: "number" },
-                  direction: { type: "string", enum: ["up", "down", "neutral"] },
-                  reason: { type: "string" },
+                  fundamental: { type: "object", properties: { score: { type: "number" }, direction: { type: "string", enum: ["up", "down", "neutral"] }, brief: { type: "string" } }, required: ["score", "direction", "brief"], additionalProperties: false },
+                  technical: { type: "object", properties: { score: { type: "number" }, direction: { type: "string", enum: ["up", "down", "neutral"] }, brief: { type: "string" } }, required: ["score", "direction", "brief"], additionalProperties: false },
+                  flow: { type: "object", properties: { score: { type: "number" }, direction: { type: "string", enum: ["up", "down", "neutral"] }, brief: { type: "string" } }, required: ["score", "direction", "brief"], additionalProperties: false },
+                  catalyst: { type: "object", properties: { score: { type: "number" }, direction: { type: "string", enum: ["up", "down", "neutral"] }, brief: { type: "string" } }, required: ["score", "direction", "brief"], additionalProperties: false },
+                  sentiment: { type: "object", properties: { score: { type: "number" }, direction: { type: "string", enum: ["up", "down", "neutral"] }, brief: { type: "string" } }, required: ["score", "direction", "brief"], additionalProperties: false },
+                  alternative: { type: "object", properties: { score: { type: "number" }, direction: { type: "string", enum: ["up", "down", "neutral"] }, brief: { type: "string" } }, required: ["score", "direction", "brief"], additionalProperties: false },
                 },
-                required: ["symbol", "name", "weightDelta", "direction", "reason"],
+                required: ["fundamental", "technical", "flow", "catalyst", "sentiment", "alternative"],
                 additionalProperties: false,
               },
-            },
-            impactAssessment: { type: "string" },
-            confidence: { type: "number" },
-            reasoning: { type: "string" },
-            counterArgument: { type: "string" },
-            macroRegime: { type: "string", enum: ["expansion", "contraction", "policy_pivot", "liquidity_squeeze", "stagflation"] },
-            nonObviousInsight: { type: "string" },
-            verificationQuestions: { type: "array", items: { type: "string" } },
-            dimensionScores: {
-              type: "object",
-              properties: {
-                fundamental: { type: "object", properties: { score: { type: "number" }, direction: { type: "string", enum: ["up", "down", "neutral"] }, brief: { type: "string" } }, required: ["score", "direction", "brief"], additionalProperties: false },
-                technical: { type: "object", properties: { score: { type: "number" }, direction: { type: "string", enum: ["up", "down", "neutral"] }, brief: { type: "string" } }, required: ["score", "direction", "brief"], additionalProperties: false },
-                flow: { type: "object", properties: { score: { type: "number" }, direction: { type: "string", enum: ["up", "down", "neutral"] }, brief: { type: "string" } }, required: ["score", "direction", "brief"], additionalProperties: false },
-                catalyst: { type: "object", properties: { score: { type: "number" }, direction: { type: "string", enum: ["up", "down", "neutral"] }, brief: { type: "string" } }, required: ["score", "direction", "brief"], additionalProperties: false },
-                sentiment: { type: "object", properties: { score: { type: "number" }, direction: { type: "string", enum: ["up", "down", "neutral"] }, brief: { type: "string" } }, required: ["score", "direction", "brief"], additionalProperties: false },
-                alternative: { type: "object", properties: { score: { type: "number" }, direction: { type: "string", enum: ["up", "down", "neutral"] }, brief: { type: "string" } }, required: ["score", "direction", "brief"], additionalProperties: false },
-              },
-              required: ["fundamental", "technical", "flow", "catalyst", "sentiment", "alternative"],
-              additionalProperties: false,
-            },
-            scenarios: {
-              type: "array",
-              items: {
-                type: "object",
-                properties: {
-                  name: { type: "string" },
-                  nameEn: { type: "string" },
-                  probability: { type: "number" },
-                  description: { type: "string" },
-                  trigger: { type: "string" },
-                  poolImpact: { type: "string" },
+              scenarios: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    name: { type: "string" },
+                    nameEn: { type: "string" },
+                    probability: { type: "number" },
+                    description: { type: "string" },
+                    trigger: { type: "string" },
+                    poolImpact: { type: "string" },
+                  },
+                  required: ["name", "nameEn", "probability", "description", "trigger", "poolImpact"],
+                  additionalProperties: false,
                 },
-                required: ["name", "nameEn", "probability", "description", "trigger", "poolImpact"],
-                additionalProperties: false,
               },
             },
+            required: ["summary", "entities", "relatedIndicators", "impacts", "impactAssessment", "confidence", "reasoning", "counterArgument", "macroRegime", "nonObviousInsight", "verificationQuestions", "dimensionScores", "scenarios"],
+            additionalProperties: false,
           },
-          required: ["summary", "entities", "relatedIndicators", "impacts", "impactAssessment", "confidence", "reasoning", "counterArgument", "macroRegime", "nonObviousInsight", "verificationQuestions", "dimensionScores", "scenarios"],
-          additionalProperties: false,
         },
       },
-    },
-  });
+    });
 
-  const analysisText = llmResult.choices[0]?.message?.content;
-  if (!analysisText || typeof analysisText !== "string") {
-    throw new Error("AI 分析返回结果为空");
+    const analysisText = llmResult.choices[0]?.message?.content;
+    if (!analysisText || typeof analysisText !== "string") {
+      throw new Error("AI 分析返回结果为空");
+    }
+    llmModel = String(llmResult.model || "unknown");
+    llmMode = "llm";
+    const fallback = buildFallbackAnalysis(input.message, currentCompanies, currentIndicators);
+    analysis = normalizeParsedAnalysis(
+      parsePossiblyWrappedJson(analysisText),
+      fallback,
+      currentCompanies
+    );
+  } catch (error) {
+    console.warn("[AutoAnalyze] LLM unavailable, fallback to local demo analysis:", error);
+    analysis = buildFallbackAnalysis(input.message, currentCompanies, currentIndicators, error);
   }
-
-  const analysis = JSON.parse(analysisText) as ParsedAnalysis;
   const now = Date.now();
   const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, "");
   const randomSuffix = Math.random().toString(36).substring(2, 6).toUpperCase();
@@ -240,13 +565,26 @@ ${NON_OBVIOUS_RULES}
   const proposedImpacts = analysis.impacts.filter(impact =>
     currentCompanies.some(company => company.symbol === impact.symbol)
   );
+  const normalizedSummary = proposedImpacts.length === 0
+    ? "未命中目标池公司，系统基于当前上下文生成了可展示的演示分析结果。"
+    : analysis.summary;
   const decision: MixedModeDecision = input.decisionMode === "auto"
     ? (shouldApplyImpacts({ confidence: analysis.confidence, impacts: proposedImpacts }) ? "full_apply" : "observe_only")
     : (input.decisionMode ?? "full_apply");
+  const effectiveDecision: MixedModeDecision = dbAvailable ? decision : "observe_only";
 
   const appliedImpacts: { symbol: string; name: string; oldWeight: number; newWeight: number; direction: "up" | "down" | "neutral"; reason: string }[] = [];
+  const candidateImpacts = proposedImpacts
+    .map(impact => {
+      const company = currentCompanies.find(c => c.symbol === impact.symbol);
+      if (!company) return null;
+      const oldWeight = company.weight;
+      const newWeight = Math.max(1, Math.min(10, oldWeight + impact.weightDelta));
+      return { symbol: impact.symbol, name: impact.name, oldWeight, newWeight, direction: impact.direction, reason: impact.reason };
+    })
+    .filter(Boolean) as { symbol: string; name: string; oldWeight: number; newWeight: number; direction: "up" | "down" | "neutral"; reason: string }[];
 
-  if (decision === "full_apply") {
+  if (effectiveDecision === "full_apply") {
     for (const impact of proposedImpacts) {
       const company = currentCompanies.find(c => c.symbol === impact.symbol);
       if (!company) continue;
@@ -279,37 +617,43 @@ ${NON_OBVIOUS_RULES}
     }
   }
 
-  await addEvidenceChain({
-    evidenceId,
-    sourceMessage: input.message,
-    sourceType: input.sourceType,
-    sourceUrl: input.sourceUrl ?? null,
-    sourceTimestamp: now,
-    analysis: {
-      entities: analysis.entities,
-      relatedIndicators: analysis.relatedIndicators,
-      impactAssessment: analysis.impactAssessment,
-      confidence: analysis.confidence,
-      reasoning: analysis.reasoning,
-      scenarios: analysis.scenarios,
-      decision,
-      proposedImpacts,
-    } as any,
-    impacts: appliedImpacts,
-    verificationQuestions: analysis.verificationQuestions,
-  });
+  if (dbAvailable) {
+    await addEvidenceChain({
+      evidenceId,
+      sourceMessage: input.message,
+      sourceType: input.sourceType,
+      sourceUrl: input.sourceUrl ?? null,
+      sourceTimestamp: now,
+      analysis: {
+        entities: analysis.entities,
+        relatedIndicators: analysis.relatedIndicators,
+        impactAssessment: analysis.impactAssessment,
+        confidence: analysis.confidence,
+        reasoning: analysis.reasoning,
+        llmModel,
+        llmMode,
+        scenarios: analysis.scenarios,
+        decision: effectiveDecision,
+        proposedImpacts,
+      } as any,
+      impacts: appliedImpacts,
+      verificationQuestions: analysis.verificationQuestions,
+    });
 
-  await addChangeLog({
-    timestamp: now,
-    action: "analysis",
-    message: decision === "full_apply"
-      ? `AI 分析完成: "${analysis.summary}" — 落地 ${appliedImpacts.length} 家公司`
-      : `自动巡检记录候选证据链: "${analysis.summary}"`,
-    reason: analysis.impactAssessment,
-    evidenceId,
-  });
+    await addChangeLog({
+      timestamp: now,
+      action: "analysis",
+      message: effectiveDecision === "full_apply"
+        ? `AI 分析完成: "${normalizedSummary}" — 命中 ${proposedImpacts.length} 家，实际调仓 ${appliedImpacts.length} 家`
+        : `自动巡检记录候选证据链: "${normalizedSummary}"`,
+      reason: analysis.impactAssessment,
+      evidenceId,
+    });
+  } else {
+    console.warn("[AutoAnalyze] Database not available, returning preview-only analysis result.");
+  }
 
-  if (decision === "full_apply") {
+  if (dbAvailable && effectiveDecision === "full_apply") {
     try {
       await detectAndNotify({
         evidenceId,
@@ -327,15 +671,17 @@ ${NON_OBVIOUS_RULES}
 
   const confidenceLevel: "high" | "medium" | "low" = analysis.confidence >= 75 ? "high" : analysis.confidence >= 45 ? "medium" : "low";
 
+  const visibleImpacts = appliedImpacts.length > 0 ? appliedImpacts : candidateImpacts;
+
   return {
     evidenceId,
-    summary: analysis.summary,
+    summary: normalizedSummary,
     entities: analysis.entities,
     relatedIndicators: analysis.relatedIndicators.map(id => {
       const indicator = currentIndicators.find(item => item.id === id);
       return indicator ? { id: indicator.id, name: indicator.name, category: indicator.category } : { id, name: "未知", category: "未知" };
     }),
-    impacts: appliedImpacts,
+    impacts: visibleImpacts,
     proposedImpacts,
     impactAssessment: analysis.impactAssessment,
     confidence: analysis.confidence,
@@ -354,9 +700,11 @@ ${NON_OBVIOUS_RULES}
       alternative: { score: 5, direction: "neutral" as const, brief: "数据不足" },
     },
     scenarios: analysis.scenarios,
-    totalCompaniesAffected: appliedImpacts.length,
+    totalCompaniesAffected: visibleImpacts.length,
     signalType: "analysis" as const,
     disclaimer: DISCLAIMER_ZH,
-    decision,
+    decision: effectiveDecision,
+    llmModel,
+    llmMode,
   };
 }

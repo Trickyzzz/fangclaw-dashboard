@@ -14,6 +14,10 @@ export default defineConfig({
   },
   test: {
     environment: "node",
+    env: {
+      DATABASE_URL: "sqlite:.codex-runtime/test-vitest.db",
+    },
+    fileParallelism: false,
     include: ["server/**/*.test.ts", "server/**/*.spec.ts"],
   },
 });

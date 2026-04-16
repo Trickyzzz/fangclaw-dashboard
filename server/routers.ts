@@ -4,13 +4,17 @@ import { systemRouter } from "./_core/systemRouter";
 import { publicProcedure, router } from "./_core/trpc";
 import { invokeLLM } from "./_core/llm";
 import { z } from "zod";
-import { eq, and, lte } from "drizzle-orm";
-import { trials } from "../drizzle/schema";
-import { getDb } from "./db";
 import {
   getAllCompanies,
   getCompanyBySymbol,
   getCompanyStats,
+  addCompanyToPool,
+  removeCompanyFromPool,
+  updateCompanyInPool,
+  bulkUpsertCompaniesToPool,
+  getWatchlist,
+  addWatchSymbol,
+  removeWatchSymbol,
   getAllIndicators,
   getChangeLogs,
   addChangeLog,
@@ -36,13 +40,22 @@ import {
   createTrial,
   getTrialByContact,
   getAllTrials,
+  updateTrialStatus,
+  expireTrials,
   createShareToken,
   getShareByToken,
 } from "./db";
 import { getRecentSecFilings } from "./data-sources/secEdgar";
 import { getRecentCninfoAnnouncements } from "./data-sources/cninfo";
+import { getRecentMarketNewsFromWallstreetcn } from "./data-sources/wallstreetcn";
+import { getIfindRealtimeQuotes } from "./data-sources/ifind";
 import { executeCausalAnalysis } from "./ingestion/autoAnalyze";
 import { runIngestionCycle } from "./ingestion/poller";
+import { buildDiscoveryScanMeta } from "./discoveryMetadata";
+import { buildDiscoveryExternalContext, toIfindCode } from "./discoveryExternalContext";
+import { buildDiscoveryScanExplanation } from "./discoveryScanExplanation";
+import { buildCandidateSignals } from "./discoveryCandidates";
+import { buildPendingReviewSignals } from "./discoveryReviewSignals";
 
 // ========== R4: A股本土化 Prompt 增强 ==========
 const A_SHARE_RULES = `
@@ -93,6 +106,62 @@ const NON_OBVIOUS_RULES = `
 const DISCLAIMER_ZH = "⚠️ 免责声明：FangClaw 系统提供的所有分析结果仅供研究参考，不构成任何投资建议。投资有风险，决策需谨慎。系统基于 AI 模型和公开信息进行分析，可能存在偏差或错误。用户应结合自身判断和专业顾问意见做出投资决策。";
 const DISCLAIMER_EN = "⚠️ Disclaimer: All analysis provided by FangClaw is for research reference only and does not constitute investment advice. Investment involves risks; decisions should be made with caution. The system analyzes based on AI models and public information, which may contain biases or errors.";
 
+function settledData<T>(result: PromiseSettledResult<T>, sourceName: string, errors: string[]) {
+  if (result.status === "fulfilled") return result.value;
+  const reason = result.reason instanceof Error ? result.reason.message : String(result.reason);
+  errors.push(`${sourceName}: ${reason}`);
+  return null;
+}
+
+function parsePossiblyWrappedJson(text: string) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    const fencedMatch = text.match(/```json\s*([\s\S]*?)\s*```/i);
+    if (fencedMatch?.[1]) return JSON.parse(fencedMatch[1]);
+    const firstBrace = text.indexOf("{");
+    const lastBrace = text.lastIndexOf("}");
+    if (firstBrace >= 0 && lastBrace > firstBrace) {
+      return JSON.parse(text.slice(firstBrace, lastBrace + 1));
+    }
+    throw new Error("因子发现返回的文本不是有效 JSON");
+  }
+}
+
+function buildFallbackDiscovery(summary: Awaited<ReturnType<typeof buildDiscoverySummary>>, error?: unknown) {
+  const watchlist = summary
+    ? summary.companySummary
+        .split("\n")
+        .map(line => line.trim().split(/\s+/)[0])
+        .filter(Boolean)
+        .slice(0, 3)
+    : [];
+  const errorMessage = error instanceof Error ? error.message : String(error ?? "");
+  return {
+    discoveredSignals: [
+      {
+        signalName: "目标池结构性观察",
+        signalNameEn: "Pool Structure Signal",
+        templateCode: "DEMO",
+        severity: "medium",
+        description: "系统进入本地兜底发现模式，优先展示目标池中的高权重标的与已触发指标。",
+        affectedSymbols: watchlist,
+        suggestedAction: "先观察高权重公司与已触发指标的共振，再补充外部数据验证。",
+        confidence: 62,
+        counterArgument: "该结论未使用外部模型深度推理，可能遗漏跨市场的潜在变量。",
+        nonObviousReason: "目标池内部权重和触发分布可快速暴露链式风险，这类结构信号常被忽略。",
+      },
+    ],
+    poolHealthAssessment: "当前可正常展示目标池和指标状态，建议优先验证触发因子的持续性。",
+    trendSummary: `当前为本地兜底发现模式。${errorMessage ? `触发原因：${errorMessage}` : ""}`,
+    watchlist,
+    riskWarnings: [
+      "如需更高质量结论，请配置可用模型并开启结构化输出能力。",
+      "兜底模式更适合演示，不应直接用于投资决策。",
+    ],
+  };
+}
+
 export const appRouter = router({
   system: systemRouter,
   dataSources: router({
@@ -105,6 +174,24 @@ export const appRouter = router({
       .input(z.object({ limit: z.number().min(1).max(20).optional() }).optional())
       .query(async ({ input }) => {
         return getRecentCninfoAnnouncements(input?.limit ?? 6);
+      }),
+    marketNews: publicProcedure
+      .input(z.object({
+        limit: z.number().min(1).max(20).optional(),
+        channel: z.enum(["a-stock-channel", "global-channel"]).optional(),
+      }).optional())
+      .query(async ({ input }) => {
+        return getRecentMarketNewsFromWallstreetcn(
+          input?.limit ?? 8,
+          input?.channel ?? "a-stock-channel"
+        );
+      }),
+    ifindRealtimeQuotes: publicProcedure
+      .input(z.object({
+        codes: z.array(z.string().min(1)).min(1).max(20),
+      }))
+      .query(async ({ input }) => {
+        return getIfindRealtimeQuotes(input.codes);
       }),
     runIngestionCycle: publicProcedure.mutation(async () => {
       return runIngestionCycle();
@@ -145,6 +232,133 @@ export const appRouter = router({
     anomalies: publicProcedure.query(async () => {
       return detectAnomalies();
     }),
+    add: publicProcedure
+      .input(z.object({
+        symbol: z.string().min(1),
+        name: z.string().min(1),
+        sector: z.string().optional(),
+        chainPosition: z.string().min(1),
+        weight: z.number().int().min(1).max(10).optional(),
+        tags: z.array(z.string()).optional(),
+      }))
+      .mutation(async ({ input }) => {
+        const symbol = input.symbol.trim().toUpperCase();
+        await addCompanyToPool({
+          symbol,
+          name: input.name,
+          sector: input.sector,
+          chainPosition: input.chainPosition,
+          weight: input.weight,
+          tags: input.tags,
+        });
+        await addChangeLog({
+          timestamp: Date.now(),
+          action: "pool_add",
+          symbol,
+          name: input.name,
+          message: `目标池新增/更新公司: ${symbol} ${input.name}`,
+          reason: "用户手动维护目标池",
+        });
+        return { success: true as const };
+      }),
+    remove: publicProcedure
+      .input(z.object({
+        symbol: z.string().min(1),
+      }))
+      .mutation(async ({ input }) => {
+        const symbol = input.symbol.trim().toUpperCase();
+        const existing = await getCompanyBySymbol(symbol);
+        await removeCompanyFromPool(symbol);
+        await addChangeLog({
+          timestamp: Date.now(),
+          action: "pool_remove",
+          symbol,
+          name: existing?.name ?? null,
+          message: `目标池移除公司: ${symbol}`,
+          reason: "用户手动维护目标池",
+        });
+        return { success: true as const };
+      }),
+    update: publicProcedure
+      .input(z.object({
+        symbol: z.string().min(1),
+        name: z.string().optional(),
+        sector: z.string().optional(),
+        chainPosition: z.string().optional(),
+        weight: z.number().int().min(1).max(10).optional(),
+        tags: z.array(z.string()).optional(),
+      }))
+      .mutation(async ({ input }) => {
+        const symbol = input.symbol.trim().toUpperCase();
+        const existing = await getCompanyBySymbol(symbol);
+        if (!existing) {
+          throw new Error(`company not found: ${symbol}`);
+        }
+        await updateCompanyInPool({
+          symbol,
+          name: input.name,
+          sector: input.sector,
+          chainPosition: input.chainPosition,
+          weight: input.weight,
+          tags: input.tags,
+        });
+        await addChangeLog({
+          timestamp: Date.now(),
+          action: "pool_edit",
+          symbol,
+          name: input.name ?? existing.name,
+          message: `目标池编辑公司: ${symbol}`,
+          reason: "用户手动维护目标池",
+        });
+        return { success: true as const };
+      }),
+    bulkUpsert: publicProcedure
+      .input(z.object({
+        items: z.array(z.object({
+          symbol: z.string().min(1),
+          name: z.string().min(1),
+          sector: z.string().optional(),
+          chainPosition: z.string().min(1),
+          weight: z.number().int().min(1).max(10).optional(),
+          tags: z.array(z.string()).optional(),
+        })).min(1).max(500),
+      }))
+      .mutation(async ({ input }) => {
+        const sanitized = input.items.map(item => ({
+          symbol: item.symbol.trim().toUpperCase(),
+          name: item.name.trim(),
+          sector: item.sector?.trim(),
+          chainPosition: item.chainPosition.trim(),
+          weight: item.weight,
+          tags: item.tags?.map(v => v.trim()).filter(Boolean),
+        }));
+        const result = await bulkUpsertCompaniesToPool(sanitized);
+        await addChangeLog({
+          timestamp: Date.now(),
+          action: "pool_bulk_import",
+          message: `目标池批量导入: 成功 ${result.successCount}，失败 ${result.failedCount}`,
+          reason: "用户批量导入 CSV",
+        });
+        return result;
+      }),
+  }),
+
+  watchlist: router({
+    list: publicProcedure
+      .input(z.object({ ownerKey: z.string().min(3) }))
+      .query(async ({ input }) => {
+        return getWatchlist(input.ownerKey);
+      }),
+    add: publicProcedure
+      .input(z.object({ ownerKey: z.string().min(3), symbol: z.string().min(1) }))
+      .mutation(async ({ input }) => {
+        return addWatchSymbol(input.ownerKey, input.symbol.toUpperCase());
+      }),
+    remove: publicProcedure
+      .input(z.object({ ownerKey: z.string().min(3), symbol: z.string().min(1) }))
+      .mutation(async ({ input }) => {
+        return removeWatchSymbol(input.ownerKey, input.symbol.toUpperCase());
+      }),
   }),
 
   // ========== 指标框架 ==========
@@ -322,29 +536,17 @@ export const appRouter = router({
         status: z.enum(["active", "expired", "converted"]),
       }))
       .mutation(async ({ input }) => {
-        const database = await getDb();
-        if (!database) return { success: false, message: "数据库不可用" };
-        await database.update(trials).set({ status: input.status }).where(eq(trials.id, input.id));
-        return { success: true };
+        return updateTrialStatus(input.id, input.status);
       }),
     /** 软删除试用（标记为 expired） */
     remove: publicProcedure
       .input(z.object({ id: z.number() }))
       .mutation(async ({ input }) => {
-        const database = await getDb();
-        if (!database) return { success: false, message: "数据库不可用" };
-        await database.update(trials).set({ status: "expired" }).where(eq(trials.id, input.id));
-        return { success: true };
+        return updateTrialStatus(input.id, "expired");
       }),
     /** 批量过期处理：将已超过有效期的试用标记为 expired */
     expireAll: publicProcedure.mutation(async () => {
-      const database = await getDb();
-      if (!database) return { success: false, message: "数据库不可用" };
-      const now = new Date();
-      await database.update(trials)
-        .set({ status: "expired" })
-        .where(and(eq(trials.status, "active"), lte(trials.expiresAt, now)));
-      return { success: true, message: "已处理过期试用" };
+      return expireTrials();
     }),
   }),
 
@@ -402,8 +604,46 @@ export const appRouter = router({
      * 系统主动扫描当前目标池状态，发现潜在因子信号
      */
     discover: publicProcedure.mutation(async () => {
+      const startedAt = Date.now();
       const summary = await buildDiscoverySummary();
       if (!summary) throw new Error("无法构建发现上下文");
+
+      const targetCompanies = await getAllCompanies() as { symbol: string }[];
+      const ifindCodes = Array.from(
+        new Set(targetCompanies.map(company => toIfindCode(company.symbol)).filter((code): code is string => Boolean(code)))
+      ).slice(0, 12);
+      const sourceErrors: string[] = [];
+      const [marketNewsResult, cninfoResult, secResult, ifindResult] = await Promise.allSettled([
+        getRecentMarketNewsFromWallstreetcn(6, "a-stock-channel"),
+        getRecentCninfoAnnouncements(6),
+        getRecentSecFilings(5),
+        ifindCodes.length > 0 ? getIfindRealtimeQuotes(ifindCodes) : Promise.resolve([]),
+      ]);
+      const marketNews = settledData(marketNewsResult, "WALLSTREETCN", sourceErrors) ?? [];
+      const announcements = settledData(cninfoResult, "CNINFO", sourceErrors) ?? [];
+      const secFilings = settledData(secResult, "SEC", sourceErrors) ?? [];
+      const ifindQuotes = settledData(ifindResult, "IFIND", sourceErrors) ?? [];
+      const externalContext = buildDiscoveryExternalContext({
+        marketNews,
+        announcements,
+        secFilings,
+        ifindQuotes,
+        sourceErrors,
+      });
+      const candidateSignals = buildCandidateSignals({
+        companies: targetCompanies.map((company: any) => ({
+          symbol: company.symbol,
+          name: company.name,
+          sector: company.sector,
+          chainPosition: company.chainPosition,
+          tags: company.tags,
+        })),
+        marketNews,
+        announcements,
+        secFilings,
+        ifindQuotes,
+      });
+      const pendingReviewSignals = buildPendingReviewSignals(candidateSignals);
 
       const systemPrompt = `你是 StockClaw 智能投研系统的因子发现引擎——Agent Swarm 蜂群智能的核心组件。你的任务是基于当前目标池的状态，主动发现非显而易见的关联（Non-Obvious Correlations）和潜在的因子信号。
 
@@ -429,6 +669,11 @@ ${summary.activeTemplates.map(t => `[${t.code}] ${t.name} (${t.category}${t.cros
 最近分析活动：
 ${summary.recentActivity.map(a => `${a.evidenceId}: ${a.message} (置信度${a.confidence})`).join("\n")}
 
+${externalContext.promptSection}
+
+候选信号预筛选（规则层生成，供 LLM 判断是否升级为高置信信号，不要机械照抄）：
+${candidateSignals.length > 0 ? candidateSignals.map((signal, index) => `${index + 1}. ${signal.title} | 标的 ${signal.affectedSymbols.join("/")} | 因子 ${signal.factorCodes.join("/")} | 置信 ${signal.confidence}% | 原因 ${signal.reasons.join("；")}`).join("\n") : "暂无候选信号"}
+
 ${A_SHARE_RULES}
 
 ${MACRO_REGIME_RULES}
@@ -448,68 +693,126 @@ ${NON_OBVIOUS_RULES}
 
 请严格按照 JSON Schema 返回结果。`;
 
-      const llmResult = await invokeLLM({
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: "请执行因子发现扫描，输出当前值得关注的信号和建议。" },
-        ],
-        response_format: {
-          type: "json_schema",
-          json_schema: {
-            name: "factor_discovery",
-            strict: true,
-            schema: {
-              type: "object",
-              properties: {
-                discoveredSignals: {
-                  type: "array",
-                  items: {
-                    type: "object",
-                    properties: {
-                      signalName: { type: "string", description: "信号名称" },
-                      signalNameEn: { type: "string", description: "英文名称" },
-                      templateCode: { type: "string", description: "关联的因子模板代码（如有）" },
-                      severity: { type: "string", enum: ["high", "medium", "low"], description: "严重程度" },
-                      description: { type: "string", description: "信号描述" },
-                      affectedSymbols: { type: "array", items: { type: "string" }, description: "受影响的股票代码" },
-                      suggestedAction: { type: "string", description: "建议操作" },
-                      confidence: { type: "number", description: "置信度（0-100）" },
-                      counterArgument: { type: "string", description: "反对论点：为什么这个信号可能是错的" },
-                      nonObviousReason: { type: "string", description: "为什么这个关联不是显而易见的" },
+      let discovery: any;
+      let discoveryMode: "llm" | "fallback" = "llm";
+      let llmModel = "unknown";
+      let llmError: string | null = null;
+      try {
+        const llmResult = await invokeLLM({
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: "请执行因子发现扫描，输出当前值得关注的信号和建议。" },
+          ],
+          routingHint: "complex_reasoning",
+          maxTokens: 2400,
+          response_format: {
+            type: "json_schema",
+            json_schema: {
+              name: "factor_discovery",
+              strict: true,
+              schema: {
+                type: "object",
+                properties: {
+                  discoveredSignals: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      properties: {
+                        signalName: { type: "string", description: "信号名称" },
+                        signalNameEn: { type: "string", description: "英文名称" },
+                        templateCode: { type: "string", description: "关联的因子模板代码（如有）" },
+                        severity: { type: "string", enum: ["high", "medium", "low"], description: "严重程度" },
+                        description: { type: "string", description: "信号描述" },
+                        affectedSymbols: { type: "array", items: { type: "string" }, description: "受影响的股票代码" },
+                        suggestedAction: { type: "string", description: "建议操作" },
+                        confidence: { type: "number", description: "置信度（0-100）" },
+                        counterArgument: { type: "string", description: "反对论点：为什么这个信号可能是错的" },
+                        nonObviousReason: { type: "string", description: "为什么这个关联不是显而易见的" },
+                      },
+                      required: ["signalName", "signalNameEn", "templateCode", "severity", "description", "affectedSymbols", "suggestedAction", "confidence", "counterArgument", "nonObviousReason"],
+                      additionalProperties: false,
                     },
-                    required: ["signalName", "signalNameEn", "templateCode", "severity", "description", "affectedSymbols", "suggestedAction", "confidence", "counterArgument", "nonObviousReason"],
-                    additionalProperties: false,
+                    description: "发现的信号列表",
                   },
-                  description: "发现的信号列表",
+                  poolHealthAssessment: { type: "string", description: "目标池整体健康度评估" },
+                  trendSummary: { type: "string", description: "当前趋势总结" },
+                  watchlist: {
+                    type: "array",
+                    items: { type: "string" },
+                    description: "建议重点关注的公司代码列表",
+                  },
+                  riskWarnings: {
+                    type: "array",
+                    items: { type: "string" },
+                    description: "风险预警信息",
+                  },
                 },
-                poolHealthAssessment: { type: "string", description: "目标池整体健康度评估" },
-                trendSummary: { type: "string", description: "当前趋势总结" },
-                watchlist: {
-                  type: "array",
-                  items: { type: "string" },
-                  description: "建议重点关注的公司代码列表",
-                },
-                riskWarnings: {
-                  type: "array",
-                  items: { type: "string" },
-                  description: "风险预警信息",
-                },
+                required: ["discoveredSignals", "poolHealthAssessment", "trendSummary", "watchlist", "riskWarnings"],
+                additionalProperties: false,
               },
-              required: ["discoveredSignals", "poolHealthAssessment", "trendSummary", "watchlist", "riskWarnings"],
-              additionalProperties: false,
             },
           },
-        },
-      });
+        });
 
-      const resultText = llmResult.choices[0]?.message?.content;
-      if (!resultText || typeof resultText !== "string") {
-        throw new Error("因子发现返回结果为空");
+        const resultText = llmResult.choices[0]?.message?.content;
+        if (!resultText || typeof resultText !== "string") {
+          throw new Error("因子发现返回结果为空");
+        }
+        llmModel = String(llmResult.model || "unknown");
+        discovery = parsePossiblyWrappedJson(resultText);
+      } catch (error) {
+        console.warn("[Discover] LLM unavailable, fallback to local discovery:", error);
+        discoveryMode = "fallback";
+        llmError = error instanceof Error ? error.message : String(error);
+        discovery = buildFallbackDiscovery(summary, error);
       }
 
-      const discovery = JSON.parse(resultText);
-
       // 记录发现日志
+      discovery = {
+        ...discovery,
+        discoveredSignals: Array.isArray(discovery.discoveredSignals) ? discovery.discoveredSignals : [],
+        poolHealthAssessment: String(discovery.poolHealthAssessment ?? "暂无目标池健康度评估"),
+        trendSummary: String(discovery.trendSummary ?? "暂无趋势总结"),
+        watchlist: Array.isArray(discovery.watchlist) ? discovery.watchlist : [],
+        riskWarnings: Array.isArray(discovery.riskWarnings) ? discovery.riskWarnings : [],
+      };
+
+      if (discovery.discoveredSignals.length === 0) {
+        if (discoveryMode === "fallback") {
+          const fallbackDiscovery = buildFallbackDiscovery(summary);
+          discovery = {
+            ...discovery,
+            discoveredSignals: fallbackDiscovery.discoveredSignals,
+            poolHealthAssessment:
+              discovery.poolHealthAssessment === "暂无目标池健康度评估"
+                ? fallbackDiscovery.poolHealthAssessment
+                : discovery.poolHealthAssessment,
+            trendSummary:
+              discovery.trendSummary === "暂无趋势总结"
+                ? fallbackDiscovery.trendSummary
+                : discovery.trendSummary,
+            watchlist: discovery.watchlist.length > 0 ? discovery.watchlist : fallbackDiscovery.watchlist,
+            riskWarnings: discovery.riskWarnings.length > 0 ? discovery.riskWarnings : fallbackDiscovery.riskWarnings,
+          };
+        } else {
+          discovery = {
+            ...discovery,
+            poolHealthAssessment:
+              discovery.poolHealthAssessment === "暂无目标池健康度评估"
+                ? "LLM 已完成目标池扫描，当前未发现需要立即行动的高置信异常。"
+                : discovery.poolHealthAssessment,
+            trendSummary:
+              discovery.trendSummary === "暂无趋势总结"
+                ? "LLM 深度扫描完成，但未返回明确的新增因子信号；建议继续观察目标池和外部数据源变化。"
+                : discovery.trendSummary,
+            riskWarnings: [
+              ...discovery.riskWarnings,
+              "本次 LLM 扫描未产生高置信发现信号，不代表目标池无风险，仅表示当前上下文不足以形成新增结论。",
+            ],
+          };
+        }
+      }
+
       await addChangeLog({
         timestamp: Date.now(),
         action: "discovery",
@@ -528,6 +831,22 @@ ${NON_OBVIOUS_RULES}
         ...discovery,
         // E4: OpenClaw compatible 标准化字段
         signalType: "discovery" as const,
+        discoveryMode,
+        llmModel,
+        llmError,
+        elapsedMs: Date.now() - startedAt,
+        scanMeta: {
+          ...buildDiscoveryScanMeta(summary),
+          dataSources: externalContext.scanMeta,
+        },
+        scanExplanation: buildDiscoveryScanExplanation({
+          signalCount: discovery.discoveredSignals.length,
+          poolHealthAssessment: discovery.poolHealthAssessment,
+          trendSummary: discovery.trendSummary,
+          dataSources: externalContext.scanMeta,
+        }),
+        candidateSignals,
+        pendingReviewSignals,
         disclaimer: DISCLAIMER_ZH,
         timestamp: Date.now(),
       };

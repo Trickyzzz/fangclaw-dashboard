@@ -1,0 +1,12 @@
+# Project-local Codex notes.
+#
+# Keep this file intentionally minimal and conservative. Durable project truth
+# lives at the repository root in:
+# - AGENTS.md
+# - docs/handoff.md
+# - docs/runbook.md
+# - docs/architecture.md
+#
+# Do not place secrets, tokens, API keys, or environment-specific credentials in
+# this file. If a future Codex version expects specific TOML keys, add them only
+# after checking the current official schema.
